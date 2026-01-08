@@ -5,6 +5,9 @@ export interface Track {
   name: string;
   url: string;
   file: File;
+  artist?: string;
+  album?: string;
+  duration?: number;
 }
 
 export interface EQBand {
@@ -37,6 +40,8 @@ export const EQ_PRESETS: Record<string, number[]> = {
   Loud: [5, 4, 3, 2, 2, 2, 3, 4, 5, 5],
 };
 
+export type RepeatMode = 'off' | 'one' | 'all';
+
 export function useAudioEngine() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTrack, setCurrentTrack] = useState<Track | null>(null);
@@ -46,6 +51,10 @@ export function useAudioEngine() {
   const [eqBands, setEqBands] = useState<EQBand[]>(DEFAULT_EQ_BANDS);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [shuffle, setShuffle] = useState(false);
+  const [repeat, setRepeat] = useState<RepeatMode>('off');
+  const [reverb, setReverb] = useState(0);
+  const [delay, setDelay] = useState(0);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -53,6 +62,26 @@ export function useAudioEngine() {
   const gainNodeRef = useRef<GainNode | null>(null);
   const eqFiltersRef = useRef<BiquadFilterNode[]>([]);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const delayNodeRef = useRef<DelayNode | null>(null);
+  const delayGainRef = useRef<GainNode | null>(null);
+  const convolverRef = useRef<ConvolverNode | null>(null);
+  const reverbGainRef = useRef<GainNode | null>(null);
+  const dryGainRef = useRef<GainNode | null>(null);
+
+  // Create impulse response for reverb
+  const createImpulseResponse = useCallback((ctx: AudioContext) => {
+    const sampleRate = ctx.sampleRate;
+    const length = sampleRate * 2;
+    const impulse = ctx.createBuffer(2, length, sampleRate);
+    
+    for (let channel = 0; channel < 2; channel++) {
+      const channelData = impulse.getChannelData(channel);
+      for (let i = 0; i < length; i++) {
+        channelData[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, 2);
+      }
+    }
+    return impulse;
+  }, []);
 
   // Initialize audio context and nodes
   const initAudioContext = useCallback(() => {
@@ -90,29 +119,101 @@ export function useAudioEngine() {
     });
     eqFiltersRef.current = filters;
 
-    // Connect: source -> filters -> gain -> analyser -> destination
+    // Create delay effect
+    const delayNode = ctx.createDelay(1);
+    delayNode.delayTime.value = 0.3;
+    delayNodeRef.current = delayNode;
+
+    const delayGain = ctx.createGain();
+    delayGain.gain.value = 0;
+    delayGainRef.current = delayGain;
+
+    // Create reverb effect
+    const convolver = ctx.createConvolver();
+    convolver.buffer = createImpulseResponse(ctx);
+    convolverRef.current = convolver;
+
+    const reverbGain = ctx.createGain();
+    reverbGain.gain.value = 0;
+    reverbGainRef.current = reverbGain;
+
+    const dryGain = ctx.createGain();
+    dryGain.gain.value = 1;
+    dryGainRef.current = dryGain;
+
+    // Connect: source -> filters -> gain -> effects -> analyser -> destination
     let lastNode: AudioNode = source;
     filters.forEach(filter => {
       lastNode.connect(filter);
       lastNode = filter;
     });
     lastNode.connect(gainNode);
-    gainNode.connect(analyser);
+
+    // Dry path
+    gainNode.connect(dryGain);
+    dryGain.connect(analyser);
+
+    // Delay path
+    gainNode.connect(delayNode);
+    delayNode.connect(delayGain);
+    delayGain.connect(analyser);
+
+    // Reverb path
+    gainNode.connect(convolver);
+    convolver.connect(reverbGain);
+    reverbGain.connect(analyser);
+
     analyser.connect(ctx.destination);
+  }, [volume, createImpulseResponse]);
 
-    // Audio events
-    audio.addEventListener('timeupdate', () => {
-      setCurrentTime(audio.currentTime);
-    });
+  // Handle track end
+  const handleTrackEnd = useCallback(() => {
+    if (repeat === 'one' && audioRef.current) {
+      audioRef.current.currentTime = 0;
+      audioRef.current.play();
+      return;
+    }
 
-    audio.addEventListener('loadedmetadata', () => {
-      setDuration(audio.duration);
-    });
-
-    audio.addEventListener('ended', () => {
+    const currentIndex = playlist.findIndex(t => t.id === currentTrack?.id);
+    if (currentIndex === -1) {
       setIsPlaying(false);
-    });
-  }, [volume]);
+      return;
+    }
+
+    let nextIndex: number;
+    if (shuffle) {
+      nextIndex = Math.floor(Math.random() * playlist.length);
+    } else {
+      nextIndex = currentIndex + 1;
+    }
+
+    if (nextIndex >= playlist.length) {
+      if (repeat === 'all') {
+        nextIndex = 0;
+      } else {
+        setIsPlaying(false);
+        return;
+      }
+    }
+
+    const nextTrack = playlist[nextIndex];
+    if (nextTrack && audioRef.current) {
+      audioRef.current.src = nextTrack.url;
+      setCurrentTrack(nextTrack);
+      setCurrentTime(0);
+      audioRef.current.play().catch(console.error);
+    }
+  }, [playlist, currentTrack, shuffle, repeat]);
+
+  // Setup audio events
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    const onEnded = () => handleTrackEnd();
+    audio.addEventListener('ended', onEnded);
+    return () => audio.removeEventListener('ended', onEnded);
+  }, [handleTrackEnd]);
 
   // Play/Pause
   const togglePlay = useCallback(async () => {
@@ -156,6 +257,25 @@ export function useAudioEngine() {
     }
   }, [initAudioContext]);
 
+  // Next track
+  const nextTrack = useCallback(() => {
+    if (playlist.length === 0) return;
+    const currentIndex = playlist.findIndex(t => t.id === currentTrack?.id);
+    let nextIndex = shuffle 
+      ? Math.floor(Math.random() * playlist.length) 
+      : (currentIndex + 1) % playlist.length;
+    playTrack(playlist[nextIndex]);
+  }, [playlist, currentTrack, shuffle, playTrack]);
+
+  // Previous track
+  const prevTrack = useCallback(() => {
+    if (playlist.length === 0) return;
+    const currentIndex = playlist.findIndex(t => t.id === currentTrack?.id);
+    let prevIndex = currentIndex - 1;
+    if (prevIndex < 0) prevIndex = playlist.length - 1;
+    playTrack(playlist[prevIndex]);
+  }, [playlist, currentTrack, playTrack]);
+
   // Add tracks to playlist
   const addTracks = useCallback((files: File[]) => {
     const newTracks: Track[] = files.map(file => ({
@@ -167,20 +287,65 @@ export function useAudioEngine() {
     
     setPlaylist(prev => [...prev, ...newTracks]);
     
-    // Auto-play first track if nothing is playing
     if (!currentTrack && newTracks.length > 0) {
       playTrack(newTracks[0]);
     }
   }, [currentTrack, playTrack]);
 
+  // Remove track
+  const removeTrack = useCallback((trackId: string) => {
+    setPlaylist(prev => prev.filter(t => t.id !== trackId));
+  }, []);
+
+  // Reorder playlist
+  const reorderPlaylist = useCallback((startIndex: number, endIndex: number) => {
+    setPlaylist(prev => {
+      const result = [...prev];
+      const [removed] = result.splice(startIndex, 1);
+      result.splice(endIndex, 0, removed);
+      return result;
+    });
+  }, []);
+
   // Update volume
   useEffect(() => {
     if (gainNodeRef.current) {
-      // Convert 0-1 volume to gain with dB gain adjustment
       const linearGain = volume * Math.pow(10, gain / 20);
       gainNodeRef.current.gain.value = linearGain;
     }
   }, [volume, gain]);
+
+  // Update delay effect
+  useEffect(() => {
+    if (delayGainRef.current) {
+      delayGainRef.current.gain.value = delay;
+    }
+  }, [delay]);
+
+  // Update reverb effect
+  useEffect(() => {
+    if (reverbGainRef.current && dryGainRef.current) {
+      reverbGainRef.current.gain.value = reverb;
+      dryGainRef.current.gain.value = 1 - reverb * 0.3;
+    }
+  }, [reverb]);
+
+  // Time update
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    const onTimeUpdate = () => setCurrentTime(audio.currentTime);
+    const onLoadedMetadata = () => setDuration(audio.duration);
+
+    audio.addEventListener('timeupdate', onTimeUpdate);
+    audio.addEventListener('loadedmetadata', onLoadedMetadata);
+
+    return () => {
+      audio.removeEventListener('timeupdate', onTimeUpdate);
+      audio.removeEventListener('loadedmetadata', onLoadedMetadata);
+    };
+  }, []);
 
   // Update EQ
   const updateEQ = useCallback((index: number, value: number) => {
@@ -228,16 +393,28 @@ export function useAudioEngine() {
     eqBands,
     currentTime,
     duration,
+    shuffle,
+    repeat,
+    reverb,
+    delay,
     
     // Actions
     togglePlay,
     playTrack,
+    nextTrack,
+    prevTrack,
     addTracks,
+    removeTrack,
+    reorderPlaylist,
     setVolume,
     setGain,
     updateEQ,
     applyPreset,
     seek,
     getAnalyser,
+    setShuffle,
+    setRepeat,
+    setReverb,
+    setDelay,
   };
 }
